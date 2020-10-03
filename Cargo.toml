@@ -1,0 +1,9 @@
+[package]
+name = "rs-scrounge-ntfs"
+version = "0.1.0"
+authors = ["Roman Kapl <code@rkapl.cz>"]
+edition = "2018"
+
+[dependencies]
+structopt = "0.3.17"
+itertools = "0.8.0"
