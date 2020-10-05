@@ -54,7 +54,7 @@ pub fn decode_data_runs(runs: &[u8]) -> Option<Vec<DataRun>> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]

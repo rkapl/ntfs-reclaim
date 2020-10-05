@@ -1,7 +1,7 @@
 use structopt::StructOpt;
-use std::{borrow::Cow, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
+use std::{borrow::Cow, cell::Cell, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
 use image::{Image, ImageData, ImageDataSlice};
-use std::io::{Write, BufRead, Result, Seek, SeekFrom};
+use std::io::{Write, BufRead, Result, Seek, SeekFrom, BufWriter};
 use std::collections::HashMap;
 use std::convert::{TryInto};
 use itertools::Itertools;
@@ -206,6 +206,18 @@ pub struct DumpContext {
     mftr_by_id: HashMap<MtfId, MtfIdx>,
 }
 
+pub trait Reporter {
+    fn report(&self, msg: &str) -> Result<()>;
+}
+
+impl<F> Reporter for F
+    where F: Fn(&str) -> Result<()> 
+{
+    fn report(&self, msg: &str) -> Result<()> {
+        self(msg)
+    }
+}
+
 fn from_utf16(slice: &[u8]) -> String {
     let mut buf = Vec::new();
     for i in 0..(slice.len()/2) {
@@ -233,7 +245,7 @@ fn filter_names(names: &mut Vec<FileInfo>) {
     }
 }
 
-fn create_hardlink_set(paths: &Vec<PathBuf>, suffix: Option<&PathBuf>) -> std::io::Result<Option<File>> {
+fn create_hardlink_set(paths: &Vec<PathBuf>, suffix: &Option<PathBuf>) -> std::io::Result<Option<File>> {
     let mut iter = paths.iter().map(|p| {
         if let Some(suffix) = suffix {
             Cow::Owned(p.clone().join(suffix))
@@ -255,12 +267,6 @@ fn create_hardlink_set(paths: &Vec<PathBuf>, suffix: Option<&PathBuf>) -> std::i
 }
 
 impl DumpContext {
-    pub fn logical_cluster(&self, cluster_id: u64) -> Result<ImageData> {
-        let cluster_bytes = (self.cluster_size as usize) * (ntfs::SECTOR as usize);
-        let off = self.partition_offset + (cluster_bytes as u64) * cluster_id;
-        self.image.read(off, cluster_bytes)
-    }
-
     pub fn get_mftr(&mut self, id: MtfId) -> Rc<RefCell<CombinedMftRecord>> {
         if let Some(idx) = self.mftr_by_id.get(&id) {
             self.mft_records[idx.0].clone()
@@ -307,6 +313,7 @@ impl DumpContext {
             }
         }
     }
+
 
     pub fn load_mftrs(&mut self) {
         let sig_file = std::fs::File::open(self.opts.working_dir.join("sig_list.txt")).unwrap();
@@ -413,6 +420,7 @@ impl DumpContext {
     }
 
     pub fn add_mtfr(&mut self, buf: ImageDataSlice) -> ParsingResult<()> {
+        // TODO: make USN fixups
         let mft_ctx = || buf.err_ctx("MFT Entry");
         let mk_err = |e| ParsingError::new(e).with_context(mft_ctx());
 
@@ -520,73 +528,118 @@ impl DumpContext {
         }
     }
 
-    pub fn dump_file(&self, file: &mut File, data_runs: &[u8]) -> Result<()> {
+    pub fn dump_file(&self, file: &mut File, reporter: &impl Reporter, data_runs: &[u8]) -> Result<()> {
         if let Some(runs) = data_runs::decode_data_runs(data_runs) {
+            let mut total = 0;
+            let mut corrupted = 0;
             for run in runs {
                 for cluster in run.lcn_offset .. (run.lcn_offset + run.lcn_length) {
                     if run.lcn_offset == 0 {
                         file.seek(SeekFrom::Current(run.lcn_length as i64))?;
                     } else {
-                        let data = self.logical_cluster(cluster)?;
-                        let slice = data.whole().into_slice();
-                        file.write_all(slice)?;
+                        for sector in 0..self.cluster_size {
+                            let sector = (cluster * (self.cluster_size as u64)) + (sector as u64);
+                            let data = self.image.read(self.partition_offset + sector * ntfs::SECTOR, ntfs::SECTOR as usize);
+                            if let Ok(data) = data {
+                                let slice = data.whole().into_slice();
+                                file.write_all(slice)?;
+                            } else {
+                                corrupted += 1;
+                            }
+                            total += 1;
+                        }
                     }
                 }
             }
+            if corrupted > 0 {
+                let percent = (corrupted  as f64)/(total as f64)*100.;
+                reporter.report(&format!("{}% is known to be corrupted", percent))?;
+            }
         } else {
             writeln!(file, "{}: The run data is corrupted", PROGRAM_NAME)?;
-            println!("Run data is corrupted");
+            reporter.report("Run data is corrupted")?;
         }
         Ok(())
     }
 
     pub fn dump(&self) -> Result<()> {
-        //let mut report = File::create(self.opts.working_dir.join("file-report.txt"))?;
+        let report = File::create(self.opts.working_dir.join("corrupted-report.txt"))?;
+        let report = RefCell::new(BufWriter::new(report));
 
         let base_path = self.opts.working_dir.clone().join("files");
         for r in self.mft_records.iter() {
             let r_ref = r.borrow();
             let r = &* r_ref;
-            let all_paths = self.get_paths(r).into_iter().map(|p| base_path.clone().join(p)).collect_vec();
+            let all_paths = self.get_paths(r);
+            let all_paths_full =all_paths.iter().map(|p| base_path.clone().join(p)).collect_vec();
+            assert!(!all_paths.is_empty());
             // println!("Paths {:?} for {:?}", all_paths, r);
 
-            if let Some(parsed) = &r.parsed {
-                let save_file_data = |suffix| -> Result<()> {
-                    let mut file = create_hardlink_set(&all_paths, suffix)?.unwrap();
-                    match &parsed.data {
-                        None => {
-                            writeln!(file, "{}: no data was found in the FS", PROGRAM_NAME)?
-                        },
-                        Some(Residency::Resident(data)) => {
-                            file.write_all(&data)?;
-                        },
-                        Some(Residency::NonResident(data_runs)) => {
-                            self.dump_file(&mut file, data_runs)?;
-                        },
+            let report_header_written = Cell::new(false);
+            let problem_reporter = |msg: &str| {
+                let mut report  = report.borrow_mut();
+                if !report_header_written.get() {
+                    report_header_written.set(true);
+                    for p in &all_paths {
+                        writeln!(report, "{}:", p.to_string_lossy())?;
                     }
-                    Ok(())
-                };
+                }
+                writeln!(report, "\t{}", msg)
+            };
+
+            if let Some(parsed) = &r.parsed {
+                let suffix;
+                let save;
                 if parsed.is_dir || !r.seen_children.is_empty() {
-                    for p in all_paths.iter() {
+                    for p in all_paths_full.iter() {
                         println!("Creating directory {}", p.to_string_lossy());
                         mkdirs(&p)?;
                     }
 
                     if !parsed.is_dir && parsed.data.is_some() {
                         // We might need to store data somewhere else if there is a directory with data...
-                        // Yes, this is a corruption but lets store the data somewhere
-                        let mut suffix = PathBuf::new();
-                        suffix.push(format!("{}-saved-data", PROGRAM_NAME));
-                        save_file_data(Some(&suffix))?;
+                        // Yes, this is a corruption but lets store the data somewhere.
+                        suffix = Some(PathBuf::from(format!("{}-saved-data", PROGRAM_NAME)));
+                        save = true;
+                    } else {
+                        save = false;
+                        suffix = None;
                     }
                 } else {
-                    for p in all_paths.iter() {
+                    for p in all_paths_full.iter() {
                         mkdirs(p.parent().unwrap())?;
                     }
-                    save_file_data(None)?;
+                    suffix = None;
+                    save = true;
+                }
+
+                if save {
+                    let mut file = create_hardlink_set(&all_paths_full, &suffix)?.unwrap();
+                    match &parsed.data {
+                        None => {
+                            writeln!(file, "{}: no data was found in the FS", PROGRAM_NAME)?;
+                            problem_reporter("No data was found in the FS")?;
+                        },
+                        Some(Residency::Resident(data)) => {
+                            file.write_all(&data)?;
+                        },
+                        Some(Residency::NonResident(data_runs)) => {
+                            self.dump_file(&mut file, &problem_reporter, data_runs)?;
+                        },
+                    }
                 }
             } else {
                 // no parsed data, create a directory if we have children, or otherwise just stub, although this should not happen
+                if r.seen_children.is_empty() {
+                    let mut file = create_hardlink_set(&all_paths_full, &None)?.unwrap();
+                    writeln!(file, "{}: not enought information about the file", PROGRAM_NAME)?;
+                    problem_reporter("not engouh information about the file")?;
+                } else {
+                    for p in all_paths_full.iter() {
+                        println!("Creating directory {}", p.to_string_lossy());
+                        mkdirs(&p)?;
+                    }
+                }
             }
         }
         Ok(())
