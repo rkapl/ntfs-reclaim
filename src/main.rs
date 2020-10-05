@@ -86,13 +86,13 @@ fn main() {
         .or_else(|| valid_boot_sect.map(|b| b.sec_per_clus))
         .unwrap_or_else(|| panic!("Cluster size could not be auto-detected, specify it manually"));
 
-    if opts.verbose {
-        println!("Using sectors per cluster value: {}", cluster_size);
-    }
+    println!("Using sectors per cluster value: {}", cluster_size);
 
     let mftr_size = opts.mft_entry
         .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.mftr_size, cluster_size)))
         .unwrap_or(1024);
+
+    println!("Using MFT record size: {}", mftr_size);
 
     if boot_sect.sector_count.val()*ntfs::SECTOR + boot_sect_offset > img.size() {
         println!("Warning: boot sector indicates that the partition is larger than the disk image, is the image complete?");
@@ -113,12 +113,17 @@ fn main() {
     };
 
     if context.opts.reuse_sigs {
+        println!("=== Loading MFT records");
         context.load_mftrs();
     } else {
+        println!("=== Searching for MFT records");
         context.find_mftrs();
     }
+
+    println!("=== Analysis");
     context.link_children();
     context.assign_names();
+    println!("=== Writing files");
     context.dump().unwrap();
 }
 
@@ -245,20 +250,21 @@ fn filter_names(names: &mut Vec<FileInfo>) {
     }
 }
 
-fn create_hardlink_set(paths: &Vec<PathBuf>, suffix: &Option<PathBuf>) -> std::io::Result<Option<File>> {
+fn create_hardlink_set(base_path: &Path, paths: &Vec<PathBuf>, suffix: &Option<PathBuf>) -> std::io::Result<Option<File>> {
     let mut iter = paths.iter().map(|p| {
         if let Some(suffix) = suffix {
-            Cow::Owned(p.clone().join(suffix))
+            p.join(suffix)
         } else {
-            Cow::Borrowed(p)
+            p.clone()
         }
     });
     if let Some(first) = iter.next() {
         println!("Writing file {}", first.to_string_lossy());
-        let file = std::fs::File::create(&*first)?;
+        let primary_path_full = base_path.join(first);
+        let file = std::fs::File::create(&primary_path_full)?;
         for p in iter {
             println!("Hardlink at {}", p.to_string_lossy());
-            std::fs::hard_link(&*first, &*p)?;
+            std::fs::hard_link(&primary_path_full, base_path.join(p))?;
         }
         Ok(Some(file))
     } else {
@@ -571,7 +577,6 @@ impl DumpContext {
             let r_ref = r.borrow();
             let r = &* r_ref;
             let all_paths = self.get_paths(r);
-            let all_paths_full =all_paths.iter().map(|p| base_path.clone().join(p)).collect_vec();
             assert!(!all_paths.is_empty());
             // println!("Paths {:?} for {:?}", all_paths, r);
 
@@ -591,9 +596,9 @@ impl DumpContext {
                 let suffix;
                 let save;
                 if parsed.is_dir || !r.seen_children.is_empty() {
-                    for p in all_paths_full.iter() {
+                    for p in all_paths.iter() {
                         println!("Creating directory {}", p.to_string_lossy());
-                        mkdirs(&p)?;
+                        mkdirs(&base_path.join(p))?;
                     }
 
                     if !parsed.is_dir && parsed.data.is_some() {
@@ -606,15 +611,15 @@ impl DumpContext {
                         suffix = None;
                     }
                 } else {
-                    for p in all_paths_full.iter() {
-                        mkdirs(p.parent().unwrap())?;
+                    for p in all_paths.iter() {
+                        mkdirs(&base_path.join(p.parent().unwrap()))?;
                     }
                     suffix = None;
                     save = true;
                 }
 
                 if save {
-                    let mut file = create_hardlink_set(&all_paths_full, &suffix)?.unwrap();
+                    let mut file = create_hardlink_set(&base_path, &all_paths, &suffix)?.unwrap();
                     match &parsed.data {
                         None => {
                             writeln!(file, "{}: no data was found in the FS", PROGRAM_NAME)?;
@@ -631,13 +636,13 @@ impl DumpContext {
             } else {
                 // no parsed data, create a directory if we have children, or otherwise just stub, although this should not happen
                 if r.seen_children.is_empty() {
-                    let mut file = create_hardlink_set(&all_paths_full, &None)?.unwrap();
+                    let mut file = create_hardlink_set(&base_path, &all_paths, &None)?.unwrap();
                     writeln!(file, "{}: not enought information about the file", PROGRAM_NAME)?;
                     problem_reporter("not engouh information about the file")?;
                 } else {
-                    for p in all_paths_full.iter() {
+                    for p in all_paths.iter() {
                         println!("Creating directory {}", p.to_string_lossy());
-                        mkdirs(&p)?;
+                        mkdirs(&base_path.join(p))?;
                     }
                 }
             }
