@@ -1,6 +1,6 @@
 use structopt::StructOpt;
-use std::{borrow::Cow, cell::Cell, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
-use image::{Image, ImageData, ImageDataSlice};
+use std::{cell::Cell, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
+use image::{Image, ImageDataSlice};
 use std::io::{Write, BufRead, Result, Seek, SeekFrom, BufWriter};
 use std::collections::HashMap;
 use std::convert::{TryInto};
@@ -190,12 +190,18 @@ impl Display for CombinedMftRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct ParsedNonResident {
+    length: u64,
+    runs: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ParsedMftRecord {
     pub mft_data_offset: u64,
     pub names: Vec<FileInfo>,
     pub is_dir: bool,
     /// Either the data itself or the RunData
-    pub data: Option<Residency<Vec<u8>, Vec<u8>>>,
+    pub data: Option<Residency<Vec<u8>, ParsedNonResident>>,
 }
 
 #[derive(Clone, Debug)]
@@ -429,7 +435,11 @@ impl DumpContext {
                         if attr_non_resident.compression_unit_size.val() != 0 {
                             return Err(mk_err("Warning: compressed files not yet supported"))
                         }
-                        parsed_mft.data = Some(Residency::NonResident(get_data_runs(attr_non_resident)?.into_slice().to_vec()))
+                        let data_runs = get_data_runs(attr_non_resident)?.into_slice().to_vec();
+                        parsed_mft.data = Some(Residency::NonResident(ParsedNonResident {
+                            length: attr_non_resident.initialized_size,
+                            runs: data_runs,
+                        }));
                     },
                 }
             }
@@ -547,25 +557,30 @@ impl DumpContext {
         }
     }
 
-    pub fn dump_file(&self, file: &mut File, reporter: &impl Reporter, data_runs: &[u8]) -> Result<()> {
-        if let Some(runs) = data_runs::decode_data_runs(data_runs) {
-            let mut total = 0;
-            let mut corrupted = 0;
+    pub fn dump_file(&self, file: &mut File, reporter: &impl Reporter, non_resident: &ParsedNonResident) -> Result<()> {
+        let length = non_resident.length;
+        if let Some(runs) = data_runs::decode_data_runs(non_resident.runs.as_slice()) {
+            let mut total = 0u64;
+            let mut corrupted = 0u64;
             for run in runs {
                 for cluster in run.lcn_offset .. (run.lcn_offset + run.lcn_length) {
                     if run.lcn_offset == 0 {
                         file.seek(SeekFrom::Current(run.lcn_length as i64))?;
                     } else {
                         for sector in 0..self.cluster_factor {
+                            if total >= length {
+                                break;
+                            }
                             let sector = (cluster * self.cluster_factor) + (sector as u64);
                             let data = self.image.read(self.partition_offset + sector * ntfs::STD_SECTOR, ntfs::STD_SECTOR as usize);
                             if let Ok(data) = data {
                                 let slice = data.whole().into_slice();
-                                file.write_all(slice)?;
+                                let chunk = ntfs::STD_SECTOR.min(length - total) as usize;
+                                file.write_all(&slice[..chunk])?;
                             } else {
-                                corrupted += 1;
+                                corrupted += 1 * ntfs::STD_SECTOR;
                             }
-                            total += 1;
+                            total += 1 * ntfs::STD_SECTOR;
                         }
                     }
                 }

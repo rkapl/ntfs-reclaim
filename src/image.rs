@@ -1,7 +1,6 @@
 use std::{cell::RefCell, fs::File};
 use std::io::{Seek, Read, SeekFrom, Result, BufRead, BufReader};
 use std::path::{PathBuf, Path};
-use std::ops::Range;
 use itertools::Itertools;
 use crate::ntfs::FromByteSlice;
 use crate::error::ParsingErrorContext;
@@ -118,14 +117,6 @@ impl Image {
 }
 
 impl ImageData {
-    pub fn range(&self) -> Range<u64> {
-        self.offset .. (self.offset + self.buf.len() as u64)
-    }
-
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
     pub fn whole(&self) -> ImageDataSlice {
         ImageDataSlice {
             slice: self.buf.as_slice(),
