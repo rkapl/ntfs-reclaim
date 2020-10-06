@@ -32,6 +32,9 @@ struct Opts {
     #[structopt(short="-c", long="--cluster")]
     cluster_size: Option<u8>,
 
+    #[structopt(short="-s", long="--sector")]
+    sector_size: Option<u16>,
+
     #[structopt(long, help="Size of the MFT entry in bytes, default is either autodetected from boot record, or 1024 is used")]
     mft_entry: Option<u64>,
 
@@ -45,11 +48,11 @@ struct Opts {
     reuse_sigs: bool,
 }
 
-fn parse_rel_size(rel_size: i8, cluster_size: u8) -> u64 {
+fn parse_rel_size(rel_size: i8, cluster_size: u64) -> u64 {
     if rel_size < 0 {
         1 << (-rel_size)
     } else {
-        (cluster_size as u64)* ntfs::SECTOR * (rel_size as u64)
+        cluster_size* (rel_size as u64)
     }
 }
 
@@ -70,7 +73,7 @@ fn main() {
     let img = image::Image::new(
         &opts.disk_image, opts.ddrescue_map.as_deref()).unwrap();
 
-    let boot_sect_offset = ntfs::SECTOR * opts.partition_offset;
+    let boot_sect_offset = ntfs::STD_SECTOR * opts.partition_offset;
     let boot_sect_data = img.read(boot_sect_offset, 512).unwrap();
     let boot_sect = boot_sect_data.whole().parse::<ntfs::BootSector>().unwrap();
 
@@ -82,11 +85,16 @@ fn main() {
         valid_boot_sect = Some(boot_sect);
     }
 
-    let cluster_size = opts.cluster_size
-        .or_else(|| valid_boot_sect.map(|b| b.sec_per_clus))
-        .unwrap_or_else(|| panic!("Cluster size could not be auto-detected, specify it manually"));
+    let sector_size = opts.sector_size
+        .or_else(|| valid_boot_sect.map(|b| b.bytes_per_sec.val()))
+        .unwrap_or_else(|| panic!("Sector size could not be auto-detected, specify it manually"));
+    println!("Sector size: {}", sector_size);
 
-    println!("Using sectors per cluster value: {}", cluster_size);
+    let cluster_factor = opts.cluster_size
+        .or_else(|| valid_boot_sect.map(|b| b.sec_per_clus))
+        .unwrap_or_else(|| panic!("Cluster size could not be auto-detected, specify it manually")) as u64;
+    let cluster_size = cluster_factor * (sector_size as u64);
+    println!("Cluster size: {}", cluster_size);
 
     let mftr_size = opts.mft_entry
         .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.mftr_size, cluster_size)))
@@ -94,7 +102,7 @@ fn main() {
 
     println!("Using MFT record size: {}", mftr_size);
 
-    if boot_sect.sector_count.val()*ntfs::SECTOR + boot_sect_offset > img.size() {
+    if boot_sect.sector_count.val()*(sector_size as u64) + boot_sect_offset > img.size() {
         println!("Warning: boot sector indicates that the partition is larger than the disk image, is the image complete?");
     }
 
@@ -105,7 +113,7 @@ fn main() {
     ignore_err(std::fs::create_dir(&opts.working_dir), std::io::ErrorKind::AlreadyExists).unwrap();
     
     let mut context = DumpContext {
-        opts, cluster_size, mftr_size,
+        opts, cluster_size, cluster_factor, sector_size, mftr_size,
         image: img,
         partition_offset: boot_sect_offset,
         mft_records: Vec::new(),
@@ -201,8 +209,12 @@ pub struct FileInfo {
 pub struct DumpContext {
     image: Image,
     opts: Opts,
-    /// Number of sectors per cluster
-    cluster_size: u8,
+    /// Size of cluster in bytes
+    cluster_size: u64,
+    /// Number of clusters in sector
+    cluster_factor: u64,
+    /// Size of sector in bytes
+    sector_size: u16,
     /// Number of bytes per MFT Record
     mftr_size: u64,
     partition_offset: u64,
@@ -445,6 +457,7 @@ impl DumpContext {
             mft_data_offset: buf.offset(),
             data: None,
         };
+
         loop {
             // Header
             let attr_header = buf.parse_at::<ntfs::AttrHeader>(current_offset)
@@ -543,9 +556,9 @@ impl DumpContext {
                     if run.lcn_offset == 0 {
                         file.seek(SeekFrom::Current(run.lcn_length as i64))?;
                     } else {
-                        for sector in 0..self.cluster_size {
-                            let sector = (cluster * (self.cluster_size as u64)) + (sector as u64);
-                            let data = self.image.read(self.partition_offset + sector * ntfs::SECTOR, ntfs::SECTOR as usize);
+                        for sector in 0..self.cluster_factor {
+                            let sector = (cluster * self.cluster_factor) + (sector as u64);
+                            let data = self.image.read(self.partition_offset + sector * ntfs::STD_SECTOR, ntfs::STD_SECTOR as usize);
                             if let Ok(data) = data {
                                 let slice = data.whole().into_slice();
                                 file.write_all(slice)?;

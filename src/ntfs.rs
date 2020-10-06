@@ -7,7 +7,7 @@ use crate::util::{u16_le, u32_le, u64_le};
  * original scrounge-ntfs
  */
 
-pub const SECTOR:u64 = 512;
+pub const STD_SECTOR:u64 = 512;
 
 pub const MFT_ID_ROOT:u32 = 0x5;
 
@@ -59,7 +59,7 @@ pub struct BootSector {
 
 impl BootSector {
     pub fn is_valid(&self) -> bool {
-        return self.sys_id == *BOOT_SECTOR_ID;
+        return (self.sys_id == *BOOT_SECTOR_ID) && (self.bytes_per_sec.val() == 512);
     }
 }
 
