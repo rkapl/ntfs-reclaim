@@ -2,7 +2,7 @@ use std::{cell::RefCell, fs::File};
 use std::io::{Seek, Read, SeekFrom, Result, BufRead, BufReader};
 use std::path::{PathBuf, Path};
 use itertools::Itertools;
-use crate::ntfs::FromByteSlice;
+use crate::ntfs::{FromByteSlice, STD_SECTOR};
 use crate::error::ParsingErrorContext;
 
 /// Somewhere to pull data from
@@ -22,6 +22,7 @@ pub struct OutOfRangeError();
 /// Currrently it is always a fresh instance, but might point into some cache in the future.
 pub struct ImageData {
     buf: Vec<u8>,
+    bad_areas: Vec<(u64, u64)>,
     offset: u64,
 }
 
@@ -31,6 +32,7 @@ pub struct ImageDataSlice<'a> {
     /// absolute offset
     offset: u64,
     slice: &'a [u8],
+    bad_areas: &'a Vec<(u64, u64)>,
 }
 
 // tranform a binary search result to get the nearest strictly smaller element
@@ -102,8 +104,9 @@ impl Image {
     pub fn read(&self, offset: u64, size: usize) -> Result<ImageData> {
         let last = offset + (size as u64) - 1;
         assert!(last < self.size);
-        if overlapping_areas((offset, last), &self.bad_areas).is_some() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "One of the sectors is marked as bad"));
+        let mut bad_areas = Vec::new();
+        if let Some((first_bad, last_bad)) = overlapping_areas((offset, last), &self.bad_areas) {
+            bad_areas.extend_from_slice(&self.bad_areas[first_bad..(last_bad + 1)])
         }
         
         self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
@@ -111,7 +114,7 @@ impl Image {
         buf.resize(size, 0);
         self.file.borrow_mut().read_exact(&mut buf)?;
         Ok(ImageData { 
-            offset, buf,
+            offset, buf, bad_areas,
         })
     }
 }
@@ -121,13 +124,38 @@ impl ImageData {
         ImageDataSlice {
             slice: self.buf.as_slice(),
             offset: self.offset,
+            bad_areas: &self.bad_areas,
         }
+    }
+    pub fn mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
 }
 
 impl<'a> ImageDataSlice<'a> {
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    pub fn is_bad(&self) -> bool {
+        overlapping_areas((self.offset, self.offset + self.slice.len() as u64 - 1), self.bad_areas).is_some()
+    }
+
+    pub fn bad_bytes(&self) -> u64 {
+        let mut acc = 0u64;
+        if self.slice.len() == 0 {
+            return 0;
+        }
+        let start = self.offset;
+        let end = self.offset + (self.slice.len() as u64) - 1;
+        for (a_start, a_end) in self.bad_areas {
+            let o_start = start.max(*a_start);
+            let o_end = end.min(*a_end);
+            if o_end >= o_start {
+                acc += o_end - o_start + 1;
+            }
+        }
+        acc
     }
 
     pub fn sub(self, offset: usize, len: usize) -> std::result::Result<ImageDataSlice<'a>, OutOfRangeError> {
@@ -137,6 +165,7 @@ impl<'a> ImageDataSlice<'a> {
             Ok(ImageDataSlice {
                 offset: self.offset + offset as u64,
                 slice: &self.slice[offset..(offset+len)],
+                bad_areas: self.bad_areas,
             })
                 
         }
@@ -149,6 +178,7 @@ impl<'a> ImageDataSlice<'a> {
             Ok(ImageDataSlice {
                 offset: self.offset + offset as u64,
                 slice: &self.slice[offset..],
+                bad_areas: self.bad_areas,
             })
                 
         }

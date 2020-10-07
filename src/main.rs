@@ -1,6 +1,6 @@
 use structopt::StructOpt;
 use std::{cell::Cell, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
-use image::{Image, ImageDataSlice};
+use image::{Image, ImageData, ImageDataSlice};
 use std::io::{Write, BufRead, Result, Seek, SeekFrom, BufWriter};
 use std::collections::HashMap;
 use std::convert::{TryInto};
@@ -35,8 +35,12 @@ struct Opts {
     #[structopt(short="-s", long="--sector")]
     sector_size: Option<u16>,
 
+
     #[structopt(long, help="Size of the MFT entry in bytes, default is either autodetected from boot record, or 1024 is used")]
     mft_entry: Option<u64>,
+
+    #[structopt(long, help="Size of the index entry in bytes, default is either autodetected from boot record, or 1024 is used")]
+    index_entry: Option<u64>,
 
     #[structopt(short, help="Be more verbose")]
     verbose: bool,
@@ -99,8 +103,12 @@ fn main() {
     let mftr_size = opts.mft_entry
         .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.mftr_size, cluster_size)))
         .unwrap_or(1024);
-
     println!("Using MFT record size: {}", mftr_size);
+
+    let index_size = opts.index_entry
+        .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.index_size, cluster_size)))
+        .unwrap_or(1024);
+    println!("Using Index record size: {}", mftr_size);
 
     if boot_sect.sector_count.val()*(sector_size as u64) + boot_sect_offset > img.size() {
         println!("Warning: boot sector indicates that the partition is larger than the disk image, is the image complete?");
@@ -109,11 +117,15 @@ fn main() {
     if opts.print_structures {
         println!("{:#X?}", boot_sect);
     }
+    let load_size = cluster_size.max(mftr_size).max(index_size).max(1024*64);
+    let min_entry_size = cluster_size.min(mftr_size).min(index_size);
+    let scan_units = (img.size() + load_size - 1) / load_size;
 
     ignore_err(std::fs::create_dir(&opts.working_dir), std::io::ErrorKind::AlreadyExists).unwrap();
     
     let mut context = DumpContext {
-        opts, cluster_size, cluster_factor, sector_size, mftr_size,
+        opts, cluster_size, cluster_factor, sector_size, mftr_size, index_size,
+        min_entry_size, scan_unit_size: load_size,
         image: img,
         partition_offset: boot_sect_offset,
         mft_records: Vec::new(),
@@ -223,7 +235,13 @@ pub struct DumpContext {
     sector_size: u16,
     /// Number of bytes per MFT Record
     mftr_size: u64,
+    /// Number of bytes per Index Record
+    index_size: u64,
     partition_offset: u64,
+
+    min_entry_size: u64,
+    scan_unit_size: u64,
+    scan_units: u64,
 
     mft_records: Vec<Rc<RefCell<CombinedMftRecord>>>,
     mftr_by_id: HashMap<MtfId, MtfIdx>,
@@ -309,11 +327,31 @@ impl DumpContext {
         }
     }
 
+    pub fn load_scan_unit(&self, idx: u64) -> Result<ImageData> {
+        // check that at least the beginning is not at least oob
+        assert!(idx < self.scan_units);
+        let size;
+        if idx == self.scan_units - 1 {
+            size = self.image.size() % self.scan_unit_size;
+        } else {
+            size = self.scan_unit_size;
+        }
+        self.image.read(self.scan_unit_size * idx, self.scan_unit_size as usize)
+    }
+
     pub fn find_mftrs(&mut self) {
         let sig_file = std::fs::File::create(self.opts.working_dir.join("sig_list.txt")).unwrap();
         let mut sig_file = std::io::BufWriter::new(sig_file);
-        let mftr_count  = self.image.size() / self.mftr_size;
-        for p in 0..mftr_count {
+
+        for i in 0..self.scan_units {
+            let data = self.load_scan_unit(i).unwrap();
+            for j in 0..(self.scan_unit_size/self.min_entry_size) {
+                let offset = i * self.scan_unit_size + j * self.min_entry_size;
+                // try the various units at their stride length
+                if offset % self.mftr_size == 0 {
+                }
+            }
+
             let off = p * self.mftr_size;
             if off % (32*1024*1024) == 0 {
                 println!("Progress: offset {:X}", off)
@@ -561,33 +599,26 @@ impl DumpContext {
         let length = non_resident.length;
         if let Some(runs) = data_runs::decode_data_runs(non_resident.runs.as_slice()) {
             let mut total = 0u64;
+            let mut total_logical = 0u64;
             let mut corrupted = 0u64;
             for run in runs {
-                for cluster in run.lcn_offset .. (run.lcn_offset + run.lcn_length) {
-                    if run.lcn_offset == 0 {
-                        file.seek(SeekFrom::Current(run.lcn_length as i64))?;
-                    } else {
-                        for sector in 0..self.cluster_factor {
-                            if total >= length {
-                                break;
-                            }
-                            let sector = (cluster * self.cluster_factor) + (sector as u64);
-                            let data = self.image.read(self.partition_offset + sector * ntfs::STD_SECTOR, ntfs::STD_SECTOR as usize);
-                            if let Ok(data) = data {
-                                let slice = data.whole().into_slice();
-                                let chunk = ntfs::STD_SECTOR.min(length - total) as usize;
-                                file.write_all(&slice[..chunk])?;
-                            } else {
-                                corrupted += 1 * ntfs::STD_SECTOR;
-                            }
-                            total += 1 * ntfs::STD_SECTOR;
-                        }
-                    }
+                let max_chunk = (length - total_logical).min(run.lcn_length * self.cluster_size) as usize;
+                if run.lcn_offset == 0 {
+                    file.seek(SeekFrom::Current(run.lcn_length as i64 * self.cluster_size as i64))?;
+                } else {
+                    let data = self.image.read(
+                        self.partition_offset + self.cluster_size * run.lcn_offset, 
+                        (self.cluster_size * run.lcn_length) as usize)?;
+                    let slice = data.whole().into_slice();
+                    corrupted += data.whole().bad_bytes();
+                    total += max_chunk as u64;
+                    file.write_all(&slice[..max_chunk])?;
                 }
+                total_logical += max_chunk as u64;
             }
             if corrupted > 0 {
                 let percent = (corrupted  as f64)/(total as f64)*100.;
-                reporter.report(&format!("{}% is known to be corrupted", percent))?;
+                reporter.report(&format!("{:.4}% is known to be corrupted", percent))?;
             }
         } else {
             writeln!(file, "{}: The run data is corrupted", PROGRAM_NAME)?;
