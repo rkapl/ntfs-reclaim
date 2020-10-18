@@ -1,6 +1,6 @@
 use structopt::StructOpt;
 use std::{cell::Cell, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
-use image::{Image, ImageData, ImageDataSlice};
+use image::{Image, ImageData, ImageDataSlice, ImageDataMutSlice};
 use std::io::{Write, BufRead, Result, Seek, SeekFrom, BufWriter};
 use std::collections::HashMap;
 use std::convert::{TryInto};
@@ -34,7 +34,6 @@ struct Opts {
 
     #[structopt(short="-s", long="--sector")]
     sector_size: Option<u16>,
-
 
     #[structopt(long, help="Size of the MFT entry in bytes, default is either autodetected from boot record, or 1024 is used")]
     mft_entry: Option<u64>,
@@ -89,6 +88,8 @@ fn main() {
         valid_boot_sect = Some(boot_sect);
     }
 
+    println!("{:?}", boot_sect);
+
     let sector_size = opts.sector_size
         .or_else(|| valid_boot_sect.map(|b| b.bytes_per_sec.val()))
         .unwrap_or_else(|| panic!("Sector size could not be auto-detected, specify it manually"));
@@ -108,7 +109,7 @@ fn main() {
     let index_size = opts.index_entry
         .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.index_size, cluster_size)))
         .unwrap_or(1024);
-    println!("Using Index record size: {}", mftr_size);
+    println!("Using Index record size: {}", index_size);
 
     if boot_sect.sector_count.val()*(sector_size as u64) + boot_sect_offset > img.size() {
         println!("Warning: boot sector indicates that the partition is larger than the disk image, is the image complete?");
@@ -117,15 +118,22 @@ fn main() {
     if opts.print_structures {
         println!("{:#X?}", boot_sect);
     }
-    let load_size = cluster_size.max(mftr_size).max(index_size).max(1024*64);
-    let min_entry_size = cluster_size.min(mftr_size).min(index_size);
-    let scan_units = (img.size() + load_size - 1) / load_size;
+    let scan_unit_size = cluster_size.max(mftr_size).max(index_size).max(1024*64);
+    let scan_units = (img.size() + scan_unit_size - 1) / scan_unit_size;
+
+    if  scan_unit_size % mftr_size!= 0 {
+        panic!("Determined scan unit size: {:#x}, but that is not multiple of MTF record size {:#x}", scan_unit_size, mftr_size);
+    }
+
+    if  scan_unit_size % index_size != 0 {
+        panic!("Determined scan unit size: {:#x}, but that is not multiple of index record size {:#x}", scan_unit_size, index_size);
+    }
 
     ignore_err(std::fs::create_dir(&opts.working_dir), std::io::ErrorKind::AlreadyExists).unwrap();
     
     let mut context = DumpContext {
         opts, cluster_size, cluster_factor, sector_size, mftr_size, index_size,
-        min_entry_size, scan_unit_size: load_size,
+        scan_unit_size, scan_units: scan_units,
         image: img,
         partition_offset: boot_sect_offset,
         mft_records: Vec::new(),
@@ -137,7 +145,7 @@ fn main() {
         context.load_mftrs();
     } else {
         println!("=== Searching for MFT records");
-        context.find_mftrs();
+        context.linear_image_scan();
     }
 
     println!("=== Analysis");
@@ -223,6 +231,12 @@ pub struct FileInfo {
     pub parent_ref: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct UsnInfo {
+    offset: u16,
+    size: u16,
+}
+
 /// A disk image with some information
 pub struct DumpContext {
     image: Image,
@@ -230,6 +244,7 @@ pub struct DumpContext {
     /// Size of cluster in bytes
     cluster_size: u64,
     /// Number of clusters in sector
+    #[allow(unused)]
     cluster_factor: u64,
     /// Size of sector in bytes
     sector_size: u16,
@@ -239,7 +254,6 @@ pub struct DumpContext {
     index_size: u64,
     partition_offset: u64,
 
-    min_entry_size: u64,
     scan_unit_size: u64,
     scan_units: u64,
 
@@ -328,7 +342,7 @@ impl DumpContext {
     }
 
     pub fn load_scan_unit(&self, idx: u64) -> Result<ImageData> {
-        // check that at least the beginning is not at least oob
+        // check that at least that the beginning is not oob
         assert!(idx < self.scan_units);
         let size;
         if idx == self.scan_units - 1 {
@@ -336,46 +350,52 @@ impl DumpContext {
         } else {
             size = self.scan_unit_size;
         }
-        self.image.read(self.scan_unit_size * idx, self.scan_unit_size as usize)
+        self.image.read(self.scan_unit_size * idx, size as usize)
     }
 
-    pub fn find_mftrs(&mut self) {
+    /// Scan the file to find MFT Records and Index Records
+    pub fn linear_image_scan(&mut self) {
         let sig_file = std::fs::File::create(self.opts.working_dir.join("sig_list.txt")).unwrap();
         let mut sig_file = std::io::BufWriter::new(sig_file);
 
+        // the basic logic is to go by scan units, then 
         for i in 0..self.scan_units {
             let data = self.load_scan_unit(i).unwrap();
-            for j in 0..(self.scan_unit_size/self.min_entry_size) {
-                let offset = i * self.scan_unit_size + j * self.min_entry_size;
-                // try the various units at their stride length
-                if offset % self.mftr_size == 0 {
-                }
-            }
-
-            let off = p * self.mftr_size;
+            let off = data.whole().offset();
+            self.scan_one_unit(data, Some(&mut sig_file));
+           
             if off % (32*1024*1024) == 0 {
                 println!("Progress: offset {:X}", off)
-            }
-            let mftr_data = self.image.read(off, self.mftr_size as usize);
-            if let Ok(mftr_data) = mftr_data {
-                let mftr = mftr_data.whole().parse::<ntfs::MftRecord>().unwrap();
-                if mftr.magic.val() == ntfs::MFT_REC_MAGIC 
-                    && (mftr.flags.val() & ntfs::MFT_REC_FLAG_USE) != 0 
-                {
-                    if self.opts.verbose {
-                        println!("Potential MFT entry {} found at offset {:X}", mftr.record_num.val(), off);
-                    }
-                    writeln!(sig_file, "FILE {:X}", off).unwrap();
-                    if let Err(e) = self.add_mtfr(mftr_data.whole()) {
-                        println!("{}", e.with_context(mftr_data.whole().err_ctx("MFT Entry")));
-                    }
-                }
-            } else {
-                // just ignore the error
             }
         }
     }
 
+    /// Go through the possible locations in the scan unit data where indices might be located.
+    /// Any fond indices are recorded to self, and possibly stored to the signature file.
+    ///
+    /// Errors are printed to scre
+    pub fn scan_one_unit(&mut self, mut data: ImageData, mut sig_output: Option<&mut impl Write>) {
+        let report = |msg, area: &mut ImageDataMutSlice, r: ParsingResult<()>| {
+            if let Err(e) = r {
+                println!("{}", e.with_context(area.borrow().as_const().err_ctx(msg)));
+            }
+        };
+        for j in 0..(self.scan_unit_size/self.mftr_size) {
+            let mut area = data.whole_mut().sub((self.mftr_size  * j) as usize, self.mftr_size as usize).unwrap();
+            let off = area.offset();
+            let hdr=  area.borrow().as_const().parse::<ntfs::MftRecord>().unwrap();
+            if hdr.magic.val() == ntfs::MFT_REC_MAGIC {
+                if self.opts.verbose {
+                    println!("Potential MFT entry {} found at offset {:X}", hdr.record_num.val(), off);
+                }
+                sig_output.as_mut().map(|sig_output| {
+                    writeln!(sig_output, "FILE {:X}", off).unwrap();
+                });
+                let err = self.parse_mftr(&mut area);
+                report( "MFT Entry", &mut area, err);
+            }
+        }
+    }
 
     pub fn load_mftrs(&mut self) {
         let sig_file = std::fs::File::open(self.opts.working_dir.join("sig_list.txt")).unwrap();
@@ -400,8 +420,8 @@ impl DumpContext {
             let offset = u64::from_str_radix(line[1], 16).unwrap_or_else(|_| panic());
             if sig == "FILE" {
                 let mftr_data = self.image.read(offset, self.mftr_size as usize);
-                if let Ok(mftr_data) = mftr_data {
-                    if let Err(e) = self.add_mtfr(mftr_data.whole()) {
+                if let Ok(mut mftr_data) = mftr_data {
+                    if let Err(e) = self.parse_mftr(&mut mftr_data.whole_mut()) {
                         println!("{}", e);
                     }
                 } else {
@@ -485,56 +505,114 @@ impl DumpContext {
         Ok(())
     }
 
-    pub fn add_mtfr(&mut self, buf: ImageDataSlice) -> ParsingResult<()> {
-        // TODO: make USN fixups
-        let mft_ctx = || buf.err_ctx("MFT Entry");
-        let mk_err = |e| ParsingError::new(e).with_context(mft_ctx());
+    pub fn parse_mftr(&mut self, buf_mut: &mut ImageDataMutSlice) -> ParsingResult<()> {
+        let mut parsed_mft;
+        let usn_info;
+        {
+            // first stage of the parsing (header)
+            let buf = buf_mut.borrow().as_const();
+            let mftr = buf.parse::<ntfs::MftRecord>().unwrap();
+            if !(mftr.magic.val() == ntfs::MFT_REC_MAGIC 
+                    && (mftr.flags.val() & ntfs::MFT_REC_FLAG_USE) != 0) {
+                return Err(ParsingError::new("MFT Entry Invalid header").with_context(buf.err_ctx("MFT Entry Header")));
+            }
+            if self.opts.print_structures {
+                println!("{:X?}", mftr);
+            }
 
-        let mftr = buf.parse::<ntfs::MftRecord>().unwrap();
-        if !(mftr.magic.val() == ntfs::MFT_REC_MAGIC 
-                && (mftr.flags.val() & ntfs::MFT_REC_FLAG_USE) != 0) {
-            return Err(mk_err("MFT Entry Malformed"))
+            parsed_mft  = ParsedMftRecord {
+                is_dir: (mftr.flags.val() & ntfs::MFT_REC_FLAG_DIR) != 0,
+                names: Vec::new(),
+                mft_data_offset: buf.offset(),
+                data: None,
+            };
+            usn_info = UsnInfo {
+                offset: mftr.update_sequence_offset.val(),
+                size: mftr.update_sequence_words.val(),
+            }
         }
-        if self.opts.print_structures {
-            println!("{:X?}", mftr);
+
+        // USN fixups
+        self.fixup_usn(buf_mut, usn_info)
+            .map_err(|e| e.with_context(buf_mut.borrow().as_const().err_ctx("MFT Entry")))?;
+
+        {
+            let buf = buf_mut.borrow().as_const();
+            let mftr = buf.parse::<ntfs::MftRecord>().unwrap();
+            let mft_ctx = || buf.err_ctx("MFT Entry");
+            let mk_err = |e| ParsingError::new(e).with_context(mft_ctx());
+
+            let mut current_offset = mftr.attributes_offset.val() as usize;
+            loop {
+                // Header
+                let attr_header = buf.parse_at::<ntfs::AttrHeader>(current_offset)
+                    .map_err(|_| mk_err("Attribute header offset out of bounds"))?;
+                if attr_header.attr_type.val() == ntfs::MFT_REC_END {
+                break;
+                }
+                let size = attr_header.attr_size.val() as usize;
+                if size == 0 || size % 8 != 0 {
+                    return Err(ParsingError::new(format!("Attribute size {} is invalid", size)).with_context(buf.tail(current_offset).unwrap().err_ctx("Attribute")));
+                }
+
+                let attr_slice = buf.sub(current_offset, size).map_err(|_| mk_err("Attribute out of bounds"))?;
+                self.parse_attr(attr_slice, attr_header, &mut parsed_mft).map_err(|e| e.with_context(mft_ctx()))?;
+
+                current_offset += size;
+            }
+            filter_names(&mut parsed_mft.names);
+            if parsed_mft.names.len() == 0 {
+                return Err(mk_err("No file names found"));
+            }
+
+            let id = MtfId(mftr.record_num.val());
+            if id.0 != 0 {
+                let rec = self.get_mftr(id);
+                rec.borrow_mut().parsed = Some(parsed_mft);
+            } else {
+                return Err(mk_err("MFT record does not contain its own index"))
+            }
+            Ok(())
         }
-        let mut current_offset = mftr.attributes_offset.val() as usize;
-        let mut parsed_mft  = ParsedMftRecord {
-            is_dir: (mftr.flags.val() & ntfs::MFT_REC_FLAG_DIR) != 0,
-            names: Vec::new(),
-            mft_data_offset: buf.offset(),
-            data: None,
+    }
+
+    /// https://flatcap.org/linux-ntfs/ntfs/concepts/fixup.html
+    pub fn fixup_usn(&self, mut_slice: &mut ImageDataMutSlice, usn_info: UsnInfo) -> ParsingResult<()> {
+        if usn_info.size == 0 {
+            return Ok(())
+        }
+        let mut sector_iter = mut_slice.borrow().chunks(self.sector_size as usize)
+            .map(|s| s.split(self.sector_size as usize - 2).unwrap()).enumerate();
+        // get the individual sectors --  the first one is a special one since it also contains the USN Array
+        let (_, (sector, first_usn)) = sector_iter.next().unwrap();
+        let usn_array = sector.as_const().sub(usn_info.offset as usize, (usn_info.size*2) as usize)
+            .map_err(|_| ParsingError::new("Update Sequence array is outside of the first sector"))?;
+
+        // some helpers
+        let get_usn_elem = |i| {
+            Ok(u16::from_le_bytes(usn_array.sub(i*2, 2).map_err(|_| 
+                ParsingError::new(format!("Update Sequence fixup number {} is out of bounds", i))
+            )?.into_slice().try_into().unwrap()))
+        };
+        let seqn = get_usn_elem(0)?;
+        let do_fixup = |i: usize, mut usn: ImageDataMutSlice| {
+            let fixup_val = get_usn_elem(i + 1)?;
+            let val = u16::from_le_bytes(usn.borrow().as_const().into_slice().try_into().unwrap());
+            if val != seqn {
+                return Err(ParsingError::new("Update Sequence number mismatch, fixup failed")
+                    .with_context(usn.borrow().as_const().err_ctx("USN Fixup location"))
+                )
+            };
+            usn.copy_from_slice(&fixup_val.to_le_bytes());
+            Ok(())
         };
 
-        loop {
-            // Header
-            let attr_header = buf.parse_at::<ntfs::AttrHeader>(current_offset)
-                .map_err(|_| mk_err("Attribute header offset out of bounds"))?;
-            if attr_header.attr_type.val() == ntfs::MFT_REC_END {
-               break;
-            }
-            let size = attr_header.attr_size.val() as usize;
-            if size == 0 || size % 8 != 0 {
-                return Err(ParsingError::new(format!("Attribute size {} is invalid", size)).with_context(buf.tail(current_offset).unwrap().err_ctx("Attribute")));
-            }
+        do_fixup(0, first_usn)?;
 
-            let attr_slice = buf.sub(current_offset, size).map_err(|_| mk_err("Attribute out of bounds"))?;
-            self.parse_attr(attr_slice, attr_header, &mut parsed_mft).map_err(|e| e.with_context(mft_ctx()))?;
-
-            current_offset += size;
-        }
-        filter_names(&mut parsed_mft.names);
-        if parsed_mft.names.len() == 0 {
-            return Err(mk_err("No file names found"));
+        for (i, (_, usn)) in sector_iter {
+            do_fixup(i, usn)?
         }
 
-        let id = MtfId(mftr.record_num.val());
-        if id.0 != 0 {
-            let rec = self.get_mftr(id);
-            rec.borrow_mut().parsed = Some(parsed_mft);
-        } else {
-            return Err(mk_err("MFT record does not contain its own index"))
-        }
         Ok(())
     }
 

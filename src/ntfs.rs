@@ -51,8 +51,10 @@ pub struct BootSector {
     /// Positive value: size in clusters
     /// Negative value: size in bytes, 2^(-n)
     pub mftr_size: i8,
+    pub padding_4: [u8; 3],
     /// Size of the index record, see mtfr_size for format
     pub index_size: i8,
+    pub padding_5: [u8; 3],
     /// Volume serial number
 	pub serial_num: u64_le,
 }

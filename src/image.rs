@@ -1,8 +1,8 @@
 use std::{cell::RefCell, fs::File};
 use std::io::{Seek, Read, SeekFrom, Result, BufRead, BufReader};
-use std::path::{PathBuf, Path};
+use std::path::{Path};
 use itertools::Itertools;
-use crate::ntfs::{FromByteSlice, STD_SECTOR};
+use crate::ntfs::{FromByteSlice};
 use crate::error::ParsingErrorContext;
 
 /// Somewhere to pull data from
@@ -32,6 +32,14 @@ pub struct ImageDataSlice<'a> {
     /// absolute offset
     offset: u64,
     slice: &'a [u8],
+    bad_areas: &'a Vec<(u64, u64)>,
+}
+
+/// Exclusive reference to slice of the `[ImageData]`
+pub struct ImageDataMutSlice<'a> {
+    /// absolute offset
+    offset: u64,
+    slice: &'a mut [u8],
     bad_areas: &'a Vec<(u64, u64)>,
 }
 
@@ -127,11 +135,16 @@ impl ImageData {
             bad_areas: &self.bad_areas,
         }
     }
-    pub fn mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buf
+    pub fn whole_mut(&mut self) -> ImageDataMutSlice {
+        ImageDataMutSlice {
+            slice: self.buf.as_mut_slice(),
+            offset: self.offset,
+            bad_areas: &self.bad_areas,
+        }
     }
 }
 
+/// Reference to part of ImageData, with accompanying meta-data (e.g. offset)
 impl<'a> ImageDataSlice<'a> {
     pub fn offset(&self) -> u64 {
         self.offset
@@ -171,7 +184,7 @@ impl<'a> ImageDataSlice<'a> {
         }
     }
 
-    pub fn tail(&self, offset: usize) -> std::result::Result<ImageDataSlice<'a>, OutOfRangeError> {
+    pub fn tail(self, offset: usize) -> std::result::Result<ImageDataSlice<'a>, OutOfRangeError> {
         if offset > self.slice.len() {
             Err(OutOfRangeError())
         } else {
@@ -207,10 +220,111 @@ impl<'a> ImageDataSlice<'a> {
     }
 }
 
+/// Mutable reference to part of ImageData, with accompanying meta-data (e.g. offset)
 impl<'a> std::ops::Deref for ImageDataSlice<'a> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
+        self.slice
+    }
+}
+
+impl<'a> ImageDataMutSlice<'a> {
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn borrow(&mut self) -> ImageDataMutSlice {
+        ImageDataMutSlice {
+            slice: self.slice,
+            bad_areas: self.bad_areas,
+            offset: self.offset,
+        }
+    }
+
+    pub fn as_const(self) -> ImageDataSlice<'a> {
+        ImageDataSlice {
+            bad_areas: self.bad_areas,
+            offset: self.offset,
+            slice: self.slice,
+        }
+    }
+
+    pub fn sub(self, offset: usize, len: usize) -> std::result::Result<ImageDataMutSlice<'a>, OutOfRangeError> {
+        if offset + len > self.slice.len() {
+            Err(OutOfRangeError())
+        } else {
+            Ok(ImageDataMutSlice {
+                offset: self.offset + offset as u64,
+                slice: &mut self.slice[offset..(offset+len)],
+                bad_areas: self.bad_areas,
+            })
+                
+        }
+    }
+
+    pub fn tail(self, offset: usize) -> std::result::Result<ImageDataMutSlice<'a>, OutOfRangeError> {
+        if offset > self.slice.len() {
+            Err(OutOfRangeError())
+        } else {
+            Ok(ImageDataMutSlice {
+                offset: self.offset + offset as u64,
+                slice: &mut self.slice[offset..],
+                bad_areas: self.bad_areas,
+            })
+                
+        }
+    }
+
+    pub fn chunks(self, size: usize) -> impl Iterator<Item=ImageDataMutSlice<'a>> + 'a {
+        let ImageDataMutSlice {bad_areas, slice, offset} = self;
+        slice.chunks_mut(size).enumerate().map(move |(i, chunk)| {
+            ImageDataMutSlice {
+                bad_areas: bad_areas,
+                offset: offset + (i * size) as u64,
+                slice: chunk,
+            }
+        })
+    }
+
+    pub fn split(self, mid: usize) -> std::result::Result<(Self, Self), OutOfRangeError> {
+        if mid > self.slice.len() {
+            return Err(OutOfRangeError());
+        }
+        let (head, tail) = self.slice.split_at_mut(mid);
+        Ok((
+            ImageDataMutSlice {
+                slice: head,
+                bad_areas: self.bad_areas,
+                offset: self.offset,
+            },
+            ImageDataMutSlice {
+                slice: tail,
+                bad_areas: self.bad_areas,
+                offset: self.offset,
+            }
+        ))
+    }
+
+    pub fn as_slice(&mut self) -> &mut [u8] {
+        self.slice
+    }
+
+    pub fn into_slice(self) -> &'a mut [u8] {
+        self.slice
+    }
+}
+
+impl<'a> std::ops::Deref for ImageDataMutSlice<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.slice
+    }
+}
+
+impl<'a> std::ops::DerefMut for ImageDataMutSlice<'a> {
+    fn deref_mut(&mut self) -> &mut [u8] {
         self.slice
     }
 }
