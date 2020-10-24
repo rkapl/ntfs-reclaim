@@ -26,6 +26,9 @@ struct Opts {
     #[structopt(short="-o", long)]
     partition_offset: u64,
 
+    #[structopt(long, help="Ignore all values in the boot sector and require their manual specification")]
+    ignore_boot_sector: bool,
+
     #[structopt(long="--partition-size", help="Size of the partition in bytes, default is autodetected from boot record")]
     partition_size: Option<u64>,
 
@@ -98,10 +101,12 @@ fn main() {
         valid_boot_sect = None;
         println!("Warning: boot sector does not appear to be valid, are partition offset specified correctly?");
     } else {
-        valid_boot_sect = Some(boot_sect);
+        if opts.ignore_boot_sector {
+            valid_boot_sect = None;
+        } else {
+            valid_boot_sect = Some(boot_sect);
+        }
     }
-
-    println!("{:?}", boot_sect);
 
     let sector_size = opts.sector_size
         .or_else(|| valid_boot_sect.map(|b| b.bytes_per_sec.val()))
@@ -112,7 +117,7 @@ fn main() {
         .or_else(|| valid_boot_sect.map(|b| b.sec_per_clus))
         .unwrap_or_else(|| panic!("Cluster size could not be auto-detected, specify it manually")) as u64;
     let cluster_size = cluster_factor * (sector_size as u64);
-    println!("Cluster size: {}", cluster_size);
+    println!("Cluster size: {}", cluster_factor);
 
     let mftr_size = opts.mft_entry
         .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.mftr_size, cluster_size)))
@@ -130,6 +135,7 @@ fn main() {
     if boot_sect_offset + partition_size > img.size()  {
         println!("Warning: boot sector indicates that the partition is larger than the disk image, is the image complete?");
     }
+    println!("Using partition size: {}", partition_size);
 
     if opts.print_structures {
         println!("{:#X?}", boot_sect);
