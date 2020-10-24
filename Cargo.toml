@@ -1,5 +1,5 @@
 [package]
-name = "rs-scrounge-ntfs"
+name = "ntfs-reclaim"
 version = "0.1.0"
 authors = ["Roman Kapl <code@rkapl.cz>"]
 edition = "2018"
