@@ -203,6 +203,7 @@ impl FromByteSlice for AttrNonResident {
 pub const ATTRT_ATTRIBUTE_LIST: u32 = 0x20;
 pub const ATTRT_FILENAME: u32 = 0x30;
 pub const ATTRT_DATA: u32 = 0x80;
+pub const ATTRT_INDEX_ROOT: u32 = 0x90;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +290,94 @@ pub const NS_WIN32: u8 = 0x01;
 pub const NS_DOS: u8 = 0x02;
 pub const NS_WINDOS: u8 = 0x03;
 
+pub const INDEX_REC_MAGIC: u32 = u32::from_le_bytes(*b"INDX");
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct IndexRecord {
+    pub magic: u32_le,
+    /// Offset to the update sequence
+    pub update_sequence_offset: u16_le,
+    /// Size in words of Update Sequence Number & Array (S)
+    pub update_sequence_words: u16_le,
+    /// $LogFile Sequence Number (LSN)
+    pub log_file_seqn: u64_le,
+    /// VCN of this Index record in the Index Allocation
+    pub vcn: u64_le,
+    pub index_node_header: IndexNodeHeader,
+}
+
+impl FromByteSlice for IndexRecord {
+    fn from_bytes(slice: &[u8]) -> &Self {
+        assert!(slice.len() >= std::mem::size_of::<Self>());
+        unsafe { &*(slice as *const [u8] as *const Self) }
+    }
+}
+
+pub const INDEX_RECORD_NODE_HEADER_OFFSET: usize = 0x18;
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct IndexNodeHeader {
+    /// Offset to the first entry
+    pub offset_first_entry: u32_le,
+    /// Total size of the Index Entries
+    pub total_size: u32_le,
+    /// Allocated size of the Node
+    pub allocated_size: u32_le,
+    /// Non-leaf node Flag (has sub-nodes)
+    pub flags: u8,
+    pub padding: [u8; 3],
+}
+
+impl FromByteSlice for IndexNodeHeader {
+    fn from_bytes(slice: &[u8]) -> &Self {
+        assert!(slice.len() >= std::mem::size_of::<Self>());
+        unsafe { &*(slice as *const [u8] as *const Self) }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct IndexEntry {
+    pub file_reference: u64_le,
+    pub entry_length: u16_le,
+    pub stream_length: u16_le,
+    pub flags: u8,
+    pub padding: [u8; 3],
+}
+
+impl FromByteSlice for IndexEntry {
+    fn from_bytes(slice: &[u8]) -> &Self {
+        assert!(slice.len() >= std::mem::size_of::<Self>());
+        unsafe { &*(slice as *const [u8] as *const Self) }
+    }
+}
+
+pub const IDX_ENTRY_FLAG_SUB_NODE: u8 = 0x01;
+pub const IDX_ENTRY_LAST: u8 = 0x02;
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct AttrIndexRoot {
+    pub attribute_type: u32_le,
+    pub collation_rule: u32_le,
+    pub bytes_per_index_record: u32_le,
+    pub clusters_per_index_records: u8,
+    pub padding: [u8; 3],
+
+    pub index_node_header: IndexNodeHeader,
+}
+
+pub const ATTR_INDEX_NODE_HEADER_OFFSET: usize = 0x10;
+
+impl FromByteSlice for AttrIndexRoot   {
+    fn from_bytes(slice: &[u8]) -> &Self {
+        assert!(slice.len() >= std::mem::size_of::<Self>());
+        unsafe { &*(slice as *const [u8] as *const Self) }
+    }
+}
+
 const MTF_FILE_NAME: &str = "$MFT";
 const SYS_PREFIX: char = '$';
 
@@ -304,5 +393,10 @@ mod test {
         assert_eq!(size_of::<AttrNonResident>(), 0x40);
         assert_eq!(size_of::<AttrResident>(), 0x18);
         assert_eq!(size_of::<AttrFileName>(), 0x42);
+
+        assert_eq!(size_of::<IndexRecord>(), 0x28);
+        assert_eq!(size_of::<IndexNodeHeader>(), 0x10);
+        assert_eq!(size_of::<IndexEntry>(), 0x10);
+        assert_eq!(size_of::<AttrIndexRoot>(), 0x20);
     }
 }

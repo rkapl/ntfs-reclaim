@@ -26,6 +26,9 @@ struct Opts {
     #[structopt(short="-o", long)]
     partition_offset: u64,
 
+    #[structopt(long="--partition-size", help="Size of the partition in bytes, default is autodetected from boot record")]
+    partition_size: Option<u64>,
+
     #[structopt(short="-m", long="--map", parse(from_os_str))]
     ddrescue_map: Option<PathBuf>,
 
@@ -49,6 +52,12 @@ struct Opts {
 
     #[structopt(long, help="Re-use saved signatures")]
     reuse_sigs: bool,
+
+    #[structopt(long, help="Try to parse indices, which may resolve some extra file names")]
+    parse_indices: bool,
+
+    #[structopt(long, help="Create stub files even if the file data is not unavailable, but the file's existence was deduced")]
+    stub_files: bool,
 }
 
 fn parse_rel_size(rel_size: i8, cluster_size: u64) -> u64 {
@@ -68,6 +77,10 @@ fn ignore_err(r: Result<()>, kind: std::io::ErrorKind) -> Result<()>{
 
 fn mkdirs(path: &Path) -> std::io::Result<()> {
     ignore_err(std::fs::create_dir_all(path), std::io::ErrorKind::AlreadyExists)
+}
+
+fn div_up(a: u64, b: u64) -> u64 {
+    (a + b - 1) / b
 }
 
 fn main() {
@@ -111,7 +124,10 @@ fn main() {
         .unwrap_or(1024);
     println!("Using Index record size: {}", index_size);
 
-    if boot_sect.sector_count.val()*(sector_size as u64) + boot_sect_offset > img.size() {
+    let partition_size = opts.partition_size
+        .or_else(|| valid_boot_sect.map(|b| b.sector_count.val()*(sector_size as u64)))
+        .unwrap_or_else(|| panic!("Partition size could not be aut-detected, specify it manually"));
+    if boot_sect_offset + partition_size > img.size()  {
         println!("Warning: boot sector indicates that the partition is larger than the disk image, is the image complete?");
     }
 
@@ -119,7 +135,7 @@ fn main() {
         println!("{:#X?}", boot_sect);
     }
     let scan_unit_size = cluster_size.max(mftr_size).max(index_size).max(1024*64);
-    let scan_units = (img.size() + scan_unit_size - 1) / scan_unit_size;
+    let scan_units = div_up(partition_size,scan_unit_size);
 
     if  scan_unit_size % mftr_size!= 0 {
         panic!("Determined scan unit size: {:#x}, but that is not multiple of MTF record size {:#x}", scan_unit_size, mftr_size);
@@ -142,7 +158,7 @@ fn main() {
 
     if context.opts.reuse_sigs {
         println!("=== Loading MFT records");
-        context.load_mftrs();
+        context.scan_by_signatures();
     } else {
         println!("=== Searching for MFT records");
         context.linear_image_scan();
@@ -187,12 +203,20 @@ pub struct MtfIdx(usize);
 
 #[derive(Clone, Debug)]
 pub struct CombinedMftRecord {
+    /// NTFS ID of the MFT
     pub mft_id: MtfId,
+    /// Our internal index in the MFT array
     pub mtf_idx: MtfIdx,
+    /// Data parsed from the MFT
     pub parsed: Option<ParsedMftRecord>,
+    /// Data parsed from indices
+    pub parsed_indices: Vec<FileInfo>,
+
+    // Based on the above data we construct these links
     pub seen_children: Vec<MtfIdx>,
     pub seen_parents: Vec<(String, MtfIdx)>,
-    /// If root, name will eventually be assigned
+
+    /// If root (no parents), name will eventually be assigned
     pub root_name: Option<String>,
 }
 
@@ -333,6 +357,7 @@ impl DumpContext {
                 parsed: None,
                 seen_children: Vec::new(),
                 seen_parents: Vec::new(),
+                parsed_indices: Vec::new(),
                 root_name: None,
             }));
             self.mft_records.push(rec.clone());
@@ -371,7 +396,7 @@ impl DumpContext {
     }
 
     /// Go through the possible locations in the scan unit data where indices might be located.
-    /// Any fond indices are recorded to self, and possibly stored to the signature file.
+    /// Any found indices are recorded to self, and possibly stored to the signature file.
     ///
     /// Errors are printed to scre
     pub fn scan_one_unit(&mut self, mut data: ImageData, mut sig_output: Option<&mut impl Write>) {
@@ -380,11 +405,13 @@ impl DumpContext {
                 println!("{}", e.with_context(area.borrow().as_const().err_ctx(msg)));
             }
         };
-        for j in 0..(self.scan_unit_size/self.mftr_size) {
+        let data_len = data.whole().len() as u64;
+
+        for j in 0..(data_len/self.mftr_size) {
             let mut area = data.whole_mut().sub((self.mftr_size  * j) as usize, self.mftr_size as usize).unwrap();
             let off = area.offset();
             let hdr=  area.borrow().as_const().parse::<ntfs::MftRecord>().unwrap();
-            if hdr.magic.val() == ntfs::MFT_REC_MAGIC {
+            if hdr.magic.val() == ntfs::MFT_REC_MAGIC && ((hdr.flags.val() & ntfs::MFT_REC_FLAG_USE) != 0) {
                 if self.opts.verbose {
                     println!("Potential MFT entry {} found at offset {:X}", hdr.record_num.val(), off);
                 }
@@ -393,11 +420,27 @@ impl DumpContext {
                 });
                 let err = self.parse_mftr(&mut area);
                 report( "MFT Entry", &mut area, err);
+            } 
+        }
+
+        for j in 0..(data_len/self.index_size) {
+            let mut area = data.whole_mut().sub((self.index_size  * j) as usize, self.index_size as usize).unwrap();
+            let off = area.offset();
+            let hdr=  area.borrow().as_const().parse::<ntfs::IndexRecord>().unwrap();
+            if hdr.magic.val() == ntfs::INDEX_REC_MAGIC {
+                if self.opts.verbose {
+                    println!("Potential Index entry found at offset {:X}", off);
+                }
+                sig_output.as_mut().map(|sig_output| {
+                    writeln!(sig_output, "INDX {:X}", off).unwrap();
+                });
+                let err = self.parse_index(&mut area);
+                report( "Index Entry", &mut area, err);
             }
         }
     }
 
-    pub fn load_mftrs(&mut self) {
+    pub fn scan_by_signatures(&mut self) {
         let sig_file = std::fs::File::open(self.opts.working_dir.join("sig_list.txt")).unwrap();
         let mut sig_file = std::io::BufReader::new(sig_file);
         let mut line_nr = 0;
@@ -427,10 +470,44 @@ impl DumpContext {
                 } else {
                     println!("Saved MFT entry at {} can not be loaded", offset);
                 }
-            } else {
+            } else if sig == "INDX" {
+                let index_data = self.image.read(offset, self.index_size as usize);
+                if let Ok(mut index_data) = index_data {
+                    if let Err(e) = self.parse_index(&mut index_data.whole_mut()) {
+                        println!("{}", e);
+                    }
+                } else {
+                    println!("Saved Index entry at {} can not be loaded", offset);
+                }
+            } 
+            else {
                 panic();
             }
         }
+    }
+
+    pub fn parse_fn_attr(&self, data: ImageDataSlice) -> ParsingResult<FileInfo> {
+        let mk_err = |m| ParsingError::new(m).with_context(data.err_ctx("File Name attribute"));
+        let attr_fn = data.parse::<ntfs::AttrFileName>().map_err(|_| mk_err("FileName attribute is too short"))?;
+        let fname = data.sub(size_of::<ntfs::AttrFileName>(),  (attr_fn.file_name_length as usize)*2)
+            .map_err(|_| mk_err("FileName out of attribute data bounds"))?;
+        let fname = from_utf16(&*fname);
+        if self.opts.print_structures {
+            println!("{:X?}, file_name = \"{}\"", attr_fn, fname);
+        }
+        match attr_fn.namespace {
+            ntfs::NS_DOS => (),
+            ntfs::NS_POSIX => (),
+            ntfs::NS_WIN32 => (),
+            ntfs::NS_WINDOS => (),
+            _ => return Err(mk_err("Invalid value for file namespace"))
+        }
+
+        Ok(FileInfo {
+            namespace: attr_fn.namespace,
+            name: fname,
+            parent_ref: attr_fn.ref_parent.val(),
+        })
     }
 
     pub fn parse_attr(&mut self, attr_buf: ImageDataSlice, attr_header: &ntfs::AttrHeader, parsed_mft: &mut ParsedMftRecord) -> ParsingResult<()> {
@@ -464,18 +541,7 @@ impl DumpContext {
         if attr_type == ntfs::ATTRT_FILENAME {
             if let Some(attr_resident) = attr_variant.resident() {
                 let resident_data = get_resident_data(attr_resident)?;
-                let attr_fn = resident_data.parse::<ntfs::AttrFileName>().map_err(|_| mk_err("FileName attribute is too short"))?;
-                let fname = resident_data.sub(size_of::<ntfs::AttrFileName>(),  (attr_fn.file_name_length as usize)*2)
-                    .map_err(|_| mk_err("FileName out of attribute data bounds"))?;
-                let fname = from_utf16(&*fname);
-                if self.opts.print_structures {
-                    println!("{:X?}, file_name = \"{}\"", attr_fn, fname);
-                }
-                parsed_mft.names.push(FileInfo {
-                    namespace: attr_fn.namespace,
-                    name: fname,
-                    parent_ref: attr_fn.ref_parent.val(),
-                });
+                parsed_mft.names.push(self.parse_fn_attr(resident_data).map_err(|e| e.with_context(mk_ctx()))?);
             } else {
                 return Err(mk_err("FileName Attribute is not resident"));
             }
@@ -499,6 +565,21 @@ impl DumpContext {
                             runs: data_runs,
                         }));
                     },
+                }
+            }
+        } else if attr_type == ntfs::ATTRT_INDEX_ROOT {
+            if self.opts.parse_indices {
+                if let Some(attr_resident) = attr_variant.resident() {
+                    let resident_data = get_resident_data(attr_resident)?;
+                    let index_root = resident_data.parse::<ntfs::AttrIndexRoot>()
+                        .map_err(|_| mk_err("Attribute too small to hold index root header"))?;
+                    let offset = ntfs::ATTR_INDEX_NODE_HEADER_OFFSET + index_root.index_node_header.offset_first_entry.val() as usize;
+                    let elements_data = resident_data.tail(offset)
+                        .map_err(|_| mk_err("Attribute elements out of attribute data"))?;
+                    self.parse_index_elements(elements_data, true)
+                        .map_err(|e| e.with_context(mk_ctx()))?;
+                } else {
+                    return Err(mk_err("FileName Attribute is not resident"));
                 }
             }
         }
@@ -536,6 +617,7 @@ impl DumpContext {
         self.fixup_usn(buf_mut, usn_info)
             .map_err(|e| e.with_context(buf_mut.borrow().as_const().err_ctx("MFT Entry")))?;
 
+        // Second stage of the parsing (attributes)
         {
             let buf = buf_mut.borrow().as_const();
             let mftr = buf.parse::<ntfs::MftRecord>().unwrap();
@@ -570,10 +652,105 @@ impl DumpContext {
                 let rec = self.get_mftr(id);
                 rec.borrow_mut().parsed = Some(parsed_mft);
             } else {
-                return Err(mk_err("MFT record does not contain its own index"))
+                return Err(mk_err("MFT Record does not have explicit ID -- is this pre XP FS? This is currently not supported"))
             }
             Ok(())
         }
+    }
+
+    pub fn parse_index_elements(&mut self, buf: ImageDataSlice, strict: bool) -> ParsingResult<()> {
+        let mk_ctx = ||  buf.err_ctx("Index Record");
+        let mk_err = |e| ParsingError::new(e).with_context(mk_ctx());
+
+        // We may not know what the type of the index is, so we just try to parse the attribute as file-name attributes
+        // and hope for the best. 
+        let mut attrs: Vec<(MtfId, FileInfo)> = Vec::new();
+        let mut failed_attrs = 0usize;
+        
+        let mut current_offset = 0;
+        loop {
+            let index_element = buf.parse_at::<ntfs::IndexEntry>(current_offset)
+                .map_err(|_| mk_err("Index element out of bounds"))?;
+
+            if (index_element.entry_length.val() as usize) < size_of::<ntfs::IndexEntry>() {
+                return Err(mk_err("Index element length is smaller than header length"))
+            }
+            let data = buf.sub(current_offset, index_element.entry_length.val() as usize)
+                .map_err(|_| mk_err("Index data out of bounds"))?;
+            if (index_element.flags & ntfs::IDX_ENTRY_LAST) == 0 {
+                let attr_data = data.sub(size_of::<ntfs::IndexEntry>(), index_element.stream_length.val() as usize)
+                    .map_err(|_| mk_err("Index attribute data out of bounds"))?;
+                if self.opts.print_structures {
+                    println!("{:X?}", index_element);
+                }
+
+                match self.parse_fn_attr(attr_data) {
+                    Ok(fi) => {
+                        let parent_id = MtfId((index_element.file_reference.val() & 0x0000FFFFFFFFFFFF) as u32);
+                        attrs.push((parent_id, fi));
+                    },
+                    Err(e) => {
+                        if strict {
+                            return Err(e);
+                        } else {
+                            failed_attrs += 1;
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+            current_offset += index_element.entry_length.val() as usize;
+        }
+        if failed_attrs == 0 {
+            // maybe choose a different heuristic?
+            for (child, fi) in attrs {
+                let mftr = self.get_mftr(child);
+                let mut mftr = mftr.borrow_mut();
+                mftr.parsed_indices.push(fi);
+            }
+        } else {
+            if self.opts.verbose {
+                println!("There were {} index elements that did not look like file name attributes", failed_attrs);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn parse_index(&mut self, buf_mut: &mut ImageDataMutSlice) -> ParsingResult<()> {
+        if !self.opts.parse_indices {
+            return Ok(())
+        }
+        // TODO: Also parse index root entries.
+        let node_header;
+        let usn_info;
+        {
+            // first stage of the parsing (header)
+            let header = buf_mut.borrow().as_const();
+            let index = header.parse::<ntfs::IndexRecord>().unwrap();
+            if self.opts.print_structures {
+                println!("{:X?}", index);
+            }
+
+            usn_info = UsnInfo {
+                offset: index.update_sequence_offset.val(),
+                size: index.update_sequence_words.val(),
+            };
+            node_header = index.index_node_header;
+        }
+
+        // USN fixups
+        self.fixup_usn(buf_mut, usn_info)
+            .map_err(|e| e.with_context(buf_mut.borrow().as_const().err_ctx("MFT Entry")))?;
+
+        // Second stage of the parsing (indexed attributes)        
+        let buf = buf_mut.borrow().as_const()
+            .tail(node_header.offset_first_entry.val() as usize + ntfs::INDEX_RECORD_NODE_HEADER_OFFSET)
+            .unwrap();
+        
+        self.parse_index_elements(buf, false)?;
+       
+        Ok(())
     }
 
     /// https://flatcap.org/linux-ntfs/ntfs/concepts/fixup.html
@@ -616,26 +793,38 @@ impl DumpContext {
         Ok(())
     }
 
+    /// Construct the directory hierarchy.
+    ///
+    /// This fills in the `seen_children` and `seen_parents` members that is are for traversal later.
     pub fn link_children(&mut self) {
+
         for idx in 0..self.mft_records.len() {
             let r_rc = self.mft_records[idx].clone();
             let mut r_ref = r_rc.borrow_mut();
             let r = &mut *r_ref;
-            if let Some(parsed) = &r.parsed {
-                for fi in parsed.names.iter() {
-                    let parent_ref = (fi.parent_ref & 0x0000FFFFFFFFFFFF) as u32;
-                    // println!("{} -> {:#X}", &*r, pref);
+            let names;
+            filter_names(&mut r.parsed_indices);
 
-                    if parent_ref == r.mft_id.0 {
-                        if r.mft_id.0 != ntfs::MFT_ID_ROOT {
-                            println!("Warning: loop")
-                        }
-                    } else {
-                        let parent_rc = self.get_mftr(MtfId(parent_ref as u32));
-                        let mut parent = parent_rc.borrow_mut();
-                        parent.seen_children.push(r.mtf_idx);
-                        r.seen_parents.push((fi.name.to_owned(), parent.mtf_idx));
+            // Prefer the names from the MFTR, not only random reference
+            if let Some(parsed) = &r.parsed {
+                names = &parsed.names;
+            } else {
+                names = &r.parsed_indices
+            }
+
+            for fi in names.iter() {
+                let parent_ref = (fi.parent_ref & 0x0000FFFFFFFFFFFF) as u32;
+                // println!("{} -> {:#X}", &*r, pref);
+
+                if parent_ref == r.mft_id.0 {
+                    if r.mft_id.0 != ntfs::MFT_ID_ROOT {
+                        println!("Warning: loop")
                     }
+                } else {
+                    let parent_rc = self.get_mftr(MtfId(parent_ref as u32));
+                    let mut parent = parent_rc.borrow_mut();
+                    parent.seen_children.push(r.mtf_idx);
+                    r.seen_parents.push((fi.name.to_owned(), parent.mtf_idx));
                 }
             }
         }
@@ -643,6 +832,7 @@ impl DumpContext {
         // todo: we should also dedup file names
     }
 
+    /// Assign names to all root items
     pub fn assign_names(&mut self) {
         for r in self.mft_records.iter() {
             let mut r = r.borrow_mut();
@@ -654,6 +844,7 @@ impl DumpContext {
         }
     }
 
+    /// Get all possible paths this file is known as
     pub fn get_paths(&self, current: &CombinedMftRecord) -> Vec<PathBuf> {
         if let Some(root_name) = &current.root_name {
             return vec![PathBuf::from(root_name)];
@@ -771,15 +962,15 @@ impl DumpContext {
                     }
                 }
             } else {
-                // no parsed data, create a directory if we have children, or otherwise just stub, although this should not happen
-                if r.seen_children.is_empty() {
-                    let mut file = create_hardlink_set(&base_path, &all_paths, &None)?.unwrap();
-                    writeln!(file, "{}: not enought information about the file", PROGRAM_NAME)?;
-                    problem_reporter("not engouh information about the file")?;
-                } else {
-                    for p in all_paths.iter() {
-                        println!("Creating directory {}", p.to_string_lossy());
-                        mkdirs(&base_path.join(p))?;
+                // no parsed data, create a stub file (only if we don't have children, in that case we are directory)
+                if self.opts.stub_files {
+                    if r.seen_children.is_empty() {
+                        for p in all_paths.iter() {
+                            mkdirs(&base_path.join(p.parent().unwrap()))?;
+                        }
+                        let mut file = create_hardlink_set(&base_path, &all_paths, &None)?.unwrap();
+                        writeln!(file, "{}: not enought information about the file", PROGRAM_NAME)?;
+                        problem_reporter("not engouh information about the file")?;
                     }
                 }
             }
