@@ -9,6 +9,7 @@ pub struct ParsingErrorContext {
 #[derive(Debug, Clone)]
 pub struct ParsingError {
     pub error_msg: String,
+    pub verbose: bool,
     pub lines: Vec<ParsingErrorContext>,
 }
 
@@ -43,8 +44,15 @@ impl ParsingError {
         Self {
             lines: Vec::new(),
             error_msg: error_msg.into(),
+            verbose: false,
         }
     }
+
+    pub fn verbose(mut self) -> Self {
+        self.verbose = true;
+        self
+    }
+
     pub fn with_context(mut self, ctx: ParsingErrorContext) -> Self {
         self.lines.push(ctx);
         self

@@ -1,4 +1,5 @@
 use structopt::StructOpt;
+use version::Version;
 use std::{cell::Cell, cell::RefCell, fmt::Display, fs::File, mem::size_of, path::{Path, PathBuf}, rc::Rc};
 use image::{Image, ImageData, ImageDataSlice, ImageDataMutSlice};
 use std::io::{Write, BufRead, Result, Seek, SeekFrom, BufWriter};
@@ -12,6 +13,7 @@ mod ntfs;
 mod image;
 mod error;
 mod data_runs;
+mod version;
 
 pub const PROGRAM_NAME: &str = "restore-ntfs";
 
@@ -41,11 +43,17 @@ struct Opts {
     #[structopt(short="-s", long="--sector")]
     sector_size: Option<u16>,
 
+    #[structopt(short="-s", long="--mft_first_cluster")]
+    mft_first_cluster: Option<u64>,
+
     #[structopt(long, help="Size of the MFT entry in bytes, default is either autodetected from boot record, or 1024 is used")]
     mft_entry: Option<u64>,
 
     #[structopt(long, help="Size of the index entry in bytes, default is either autodetected from boot record, or 1024 is used")]
     index_entry: Option<u64>,
+
+    #[structopt(long, help="NTFS Volume version. Defaults to 3.1, can not be currently detected from the image (TBD).", default_value="3.1")]
+    ntfs_version: Version,
 
     #[structopt(short, help="Be more verbose")]
     verbose: bool,
@@ -109,25 +117,36 @@ fn main() {
     }
 
     let sector_size = opts.sector_size
-        .or_else(|| valid_boot_sect.map(|b| b.bytes_per_sec.val()))
+        .or(valid_boot_sect.map(|b| b.bytes_per_sec.val()))
         .unwrap_or_else(|| panic!("Sector size could not be auto-detected, specify it manually"));
     println!("Sector size: {}", sector_size);
 
     let cluster_factor = opts.cluster_size
-        .or_else(|| valid_boot_sect.map(|b| b.sec_per_clus))
+        .or(valid_boot_sect.map(|b| b.sec_per_clus))
         .unwrap_or_else(|| panic!("Cluster size could not be auto-detected, specify it manually")) as u64;
     let cluster_size = cluster_factor * (sector_size as u64);
     println!("Cluster size: {}", cluster_factor);
 
     let mftr_size = opts.mft_entry
-        .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.mftr_size, cluster_size)))
+        .or(valid_boot_sect.map(|b| parse_rel_size(b.mftr_size, cluster_size)))
         .unwrap_or(1024);
     println!("Using MFT record size: {}", mftr_size);
 
     let index_size = opts.index_entry
-        .or_else(|| valid_boot_sect.map(|b| parse_rel_size(b.index_size, cluster_size)))
+        .or(valid_boot_sect.map(|b| parse_rel_size(b.index_size, cluster_size)))
         .unwrap_or(1024);
     println!("Using Index record size: {}", index_size);
+
+    let mft_first_cluster = opts.mft_first_cluster
+        .or(valid_boot_sect.map(|b| b.off_mft.val()));
+
+    if mft_first_cluster.is_none() && opts.ntfs_version < Version(3, 1) {
+        panic!("MFT first cluster must be specified if using NTFS version < 3.1");
+    }
+
+    if mft_first_cluster.is_some() {
+        println!("Using MFT first cluster: {}", mft_first_cluster.unwrap());
+    }
 
     let partition_size = opts.partition_size
         .or_else(|| valid_boot_sect.map(|b| b.sector_count.val()*(sector_size as u64)))
@@ -155,7 +174,7 @@ fn main() {
     
     let mut context = DumpContext {
         opts, cluster_size, cluster_factor, sector_size, mftr_size, index_size,
-        scan_unit_size, scan_units: scan_units,
+        scan_unit_size, scan_units, mft_first_cluster,
         image: img,
         partition_offset: boot_sect_offset,
         mft_records: Vec::new(),
@@ -201,26 +220,26 @@ impl<R, N> Residency<R, N> {
 
 /// ID is index inside the MFT (record number)
 #[derive(Debug, Clone, Copy, Hash, Ord, PartialOrd, Eq, PartialEq)]
-pub struct MtfId(u32);
+pub struct MftId(u32);
 
 /// Index is index into the table
 #[derive(Debug, Clone, Copy, Hash, Ord, PartialOrd, Eq, PartialEq)]
-pub struct MtfIdx(usize);
+pub struct MftIdx(usize);
 
 #[derive(Clone, Debug)]
 pub struct CombinedMftRecord {
     /// NTFS ID of the MFT
-    pub mft_id: MtfId,
+    pub mft_id: MftId,
     /// Our internal index in the MFT array
-    pub mtf_idx: MtfIdx,
+    pub mtf_idx: MftIdx,
     /// Data parsed from the MFT
     pub parsed: Option<ParsedMftRecord>,
     /// Data parsed from indices
     pub parsed_indices: Vec<FileInfo>,
 
     // Based on the above data we construct these links
-    pub seen_children: Vec<MtfIdx>,
-    pub seen_parents: Vec<(String, MtfIdx)>,
+    pub seen_children: Vec<MftIdx>,
+    pub seen_parents: Vec<(String, MftIdx)>,
 
     /// If root (no parents), name will eventually be assigned
     pub root_name: Option<String>,
@@ -280,6 +299,10 @@ pub struct DumpContext {
     sector_size: u16,
     /// Number of bytes per MFT Record
     mftr_size: u64,
+
+    /// First MFT cluster
+    mft_first_cluster: Option<u64>,
+
     /// Number of bytes per Index Record
     index_size: u64,
     partition_offset: u64,
@@ -288,7 +311,7 @@ pub struct DumpContext {
     scan_units: u64,
 
     mft_records: Vec<Rc<RefCell<CombinedMftRecord>>>,
-    mftr_by_id: HashMap<MtfId, MtfIdx>,
+    mftr_by_id: HashMap<MftId, MftIdx>,
 }
 
 pub trait Reporter {
@@ -353,11 +376,11 @@ fn create_hardlink_set(base_path: &Path, paths: &Vec<PathBuf>, suffix: &Option<P
 }
 
 impl DumpContext {
-    pub fn get_mftr(&mut self, id: MtfId) -> Rc<RefCell<CombinedMftRecord>> {
+    pub fn get_mftr(&mut self, id: MftId) -> Rc<RefCell<CombinedMftRecord>> {
         if let Some(idx) = self.mftr_by_id.get(&id) {
             self.mft_records[idx.0].clone()
         } else {
-            let idx = MtfIdx(self.mft_records.len());
+            let idx = MftIdx(self.mft_records.len());
             let rec = Rc::new(RefCell::new(CombinedMftRecord {
                 mft_id: id, mtf_idx: idx,
                 parsed: None,
@@ -370,6 +393,13 @@ impl DumpContext {
             self.mftr_by_id.insert(id, idx);
             return rec;
         }
+    }
+
+    pub fn print_parsing_err(&self, err: ParsingError) {
+        if err.verbose && !self.opts.verbose {
+            return;
+        }
+        println!("{}", err);
     }
 
     pub fn load_scan_unit(&self, idx: u64) -> Result<ImageData> {
@@ -406,13 +436,7 @@ impl DumpContext {
     ///
     /// Errors are printed to scre
     pub fn scan_one_unit(&mut self, mut data: ImageData, mut sig_output: Option<&mut impl Write>) {
-        let report = |msg, area: &mut ImageDataMutSlice, r: ParsingResult<()>| {
-            if let Err(e) = r {
-                println!("{}", e.with_context(area.borrow().as_const().err_ctx(msg)));
-            }
-        };
         let data_len = data.whole().len() as u64;
-
         for j in 0..(data_len/self.mftr_size) {
             let mut area = data.whole_mut().sub((self.mftr_size  * j) as usize, self.mftr_size as usize).unwrap();
             let off = area.offset();
@@ -425,7 +449,9 @@ impl DumpContext {
                     writeln!(sig_output, "FILE {:X}", off).unwrap();
                 });
                 let err = self.parse_mftr(&mut area);
-                report( "MFT Entry", &mut area, err);
+                if let Err(err) = err {
+                    self.print_parsing_err(err.with_context(area.as_const().err_ctx("MFT Entry")));
+                }
             } 
         }
 
@@ -441,7 +467,9 @@ impl DumpContext {
                     writeln!(sig_output, "INDX {:X}", off).unwrap();
                 });
                 let err = self.parse_index(&mut area);
-                report( "Index Entry", &mut area, err);
+                if let Err(err) = err {
+                    self.print_parsing_err(err.with_context(area.as_const().err_ctx("Index Entry")));
+                }
             }
         }
     }
@@ -471,7 +499,7 @@ impl DumpContext {
                 let mftr_data = self.image.read(offset, self.mftr_size as usize);
                 if let Ok(mut mftr_data) = mftr_data {
                     if let Err(e) = self.parse_mftr(&mut mftr_data.whole_mut()) {
-                        println!("{}", e);
+                        self.print_parsing_err(e);
                     }
                 } else {
                     println!("Saved MFT entry at {} can not be loaded", offset);
@@ -480,7 +508,7 @@ impl DumpContext {
                 let index_data = self.image.read(offset, self.index_size as usize);
                 if let Ok(mut index_data) = index_data {
                     if let Err(e) = self.parse_index(&mut index_data.whole_mut()) {
-                        println!("{}", e);
+                        self.print_parsing_err(e);
                     }
                 } else {
                     println!("Saved Index entry at {} can not be loaded", offset);
@@ -594,18 +622,60 @@ impl DumpContext {
 
     pub fn parse_mftr(&mut self, buf_mut: &mut ImageDataMutSlice) -> ParsingResult<()> {
         let mut parsed_mft;
+        let mft_id: MftId;
         let usn_info;
         {
             // first stage of the parsing (header)
             let buf = buf_mut.borrow().as_const();
+            let mk_err = |s| ParsingError::new(s).with_context(buf.err_ctx("MFT Entry Header"));
             let mftr = buf.parse::<ntfs::MftRecord>().unwrap();
             if !(mftr.magic.val() == ntfs::MFT_REC_MAGIC 
                     && (mftr.flags.val() & ntfs::MFT_REC_FLAG_USE) != 0) {
-                return Err(ParsingError::new("MFT Entry Invalid header").with_context(buf.err_ctx("MFT Entry Header")));
+                return Err(mk_err("MFT Entry Invalid header"));
             }
             if self.opts.print_structures {
                 println!("{:X?}", mftr);
             }
+
+            // determine the ID
+            let id_internal;
+
+            if self.opts.ntfs_version >= Version(3,1) {
+                id_internal = Some(MftId(mftr.record_num.val()));
+            } else {
+                id_internal = None;
+            }
+
+            let id_from_numbering;
+            if let Some(first_cluster) = self.mft_first_cluster {
+                let first_offset = first_cluster * self.cluster_size;
+                assert!(buf.offset() >= self.partition_offset);
+                let my_offset = buf.offset() - self.partition_offset;
+                if my_offset < first_offset {
+                    return Err(mk_err("MFT Entry is before advertised MFT start, ignoring").verbose())
+                }
+                let diff = my_offset - first_offset;
+                if diff % self.mftr_size != 0 {
+                    return Err(mk_err("MFT Entry is at unexpected address"));
+                }
+                id_from_numbering = Some(MftId((diff / self.mftr_size) as u32));
+            } else {
+                id_from_numbering = None;
+            }
+
+            mft_id = match (id_from_numbering, id_internal) {
+                (Some(id_from_numbering), Some(id_internal)) => {
+                    if id_from_numbering == id_internal {
+                        Ok(id_from_numbering)
+                    } else {
+                        let msg = format!("MFT ID in the record ({:?}) does not match its position in the MFT ({:?})", id_internal, id_from_numbering);
+                        Err(mk_err(&msg).verbose())
+                    }
+                },
+                (Some(id), _) => Ok(id),
+                (_, Some(id)) => Ok(id),
+                (None, None) => panic!("Internal error: Internal ID or ID from number should always be available")
+            }?;
 
             parsed_mft  = ParsedMftRecord {
                 is_dir: (mftr.flags.val() & ntfs::MFT_REC_FLAG_DIR) != 0,
@@ -653,13 +723,8 @@ impl DumpContext {
                 return Err(mk_err("No file names found"));
             }
 
-            let id = MtfId(mftr.record_num.val());
-            if id.0 != 0 {
-                let rec = self.get_mftr(id);
-                rec.borrow_mut().parsed = Some(parsed_mft);
-            } else {
-                return Err(mk_err("MFT Record does not have explicit ID -- is this pre XP FS? This is currently not supported"))
-            }
+            let rec = self.get_mftr(mft_id);
+            rec.borrow_mut().parsed = Some(parsed_mft);
             Ok(())
         }
     }
@@ -670,7 +735,7 @@ impl DumpContext {
 
         // We may not know what the type of the index is, so we just try to parse the attribute as file-name attributes
         // and hope for the best. 
-        let mut attrs: Vec<(MtfId, FileInfo)> = Vec::new();
+        let mut attrs: Vec<(MftId, FileInfo)> = Vec::new();
         let mut failed_attrs = 0usize;
         
         let mut current_offset = 0;
@@ -692,7 +757,7 @@ impl DumpContext {
 
                 match self.parse_fn_attr(attr_data) {
                     Ok(fi) => {
-                        let parent_id = MtfId((index_element.file_reference.val() & 0x0000FFFFFFFFFFFF) as u32);
+                        let parent_id = MftId((index_element.file_reference.val() & 0x0000FFFFFFFFFFFF) as u32);
                         attrs.push((parent_id, fi));
                     },
                     Err(e) => {
@@ -827,7 +892,7 @@ impl DumpContext {
                         println!("Warning: loop")
                     }
                 } else {
-                    let parent_rc = self.get_mftr(MtfId(parent_ref as u32));
+                    let parent_rc = self.get_mftr(MftId(parent_ref as u32));
                     let mut parent = parent_rc.borrow_mut();
                     parent.seen_children.push(r.mtf_idx);
                     r.seen_parents.push((fi.name.to_owned(), parent.mtf_idx));
