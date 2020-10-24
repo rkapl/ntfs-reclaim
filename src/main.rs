@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::convert::{TryInto};
 use itertools::Itertools;
 use error::{ParsingError, ParsingResult};
+use progressive::progress;
 
 mod util;
 mod ntfs;
@@ -420,14 +421,9 @@ impl DumpContext {
         let mut sig_file = std::io::BufWriter::new(sig_file);
 
         // the basic logic is to go by scan units, then 
-        for i in 0..self.scan_units {
+        for i in progress(0..self.scan_units) {
             let data = self.load_scan_unit(i).unwrap();
-            let off = data.whole().offset();
             self.scan_one_unit(data, Some(&mut sig_file));
-           
-            if off % (32*1024*1024) == 0 {
-                println!("Progress: offset {:X}", off)
-            }
         }
     }
 
