@@ -44,7 +44,7 @@ struct Opts {
     #[structopt(short="-s", long="--sector")]
     sector_size: Option<u16>,
 
-    #[structopt(short="-s", long="--mft_first_cluster")]
+    #[structopt(long)]
     mft_first_cluster: Option<u64>,
 
     #[structopt(long, help="Size of the MFT entry in bytes, default is either autodetected from boot record, or 1024 is used")]
