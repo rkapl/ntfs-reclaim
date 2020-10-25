@@ -53,7 +53,7 @@ struct Opts {
     #[structopt(long, help="Size of the index entry in bytes, default is either autodetected from boot record, or 1024 is used")]
     index_entry: Option<u64>,
 
-    #[structopt(long, help="NTFS Volume version. Defaults to 3.1, can not be currently detected from the image (TBD).", default_value="3.1")]
+    #[structopt(long, help="NTFS Volume version. Can not be currently detected from the image (TBD).", default_value="3.1")]
     ntfs_version: Version,
 
     #[structopt(short, help="Be more verbose")]
