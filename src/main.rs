@@ -525,6 +525,10 @@ impl DumpContext {
         if self.opts.print_structures {
             println!("{:X?}, file_name = \"{}\"", attr_fn, fname);
         }
+        if fname == ".." || fname == "." || fname.contains(std::path::is_separator) {
+            // TODO: further sanitization is needed on windows, e.g. to remove special file names (aux etc.)
+            return Err(mk_err("File name contains illegal characters"));
+        }
         match attr_fn.namespace {
             ntfs::NS_DOS => (),
             ntfs::NS_POSIX => (),
